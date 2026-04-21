@@ -3,10 +3,12 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"notification-service/internal/clients"
 	"notification-service/internal/models"
+	"notification-service/internal/transport/tg"
 	"notification-service/pkg/logger"
 
 	"github.com/segmentio/kafka-go"
@@ -15,9 +17,10 @@ import (
 type Consumer struct {
 	reader *kafka.Reader
 	auth   *clients.AuthClient
+	bot    *tg.Bot
 }
 
-func NewConsumer(brokers []string, topic, groupID string, auth *clients.AuthClient) *Consumer {
+func NewConsumer(brokers []string, topic, groupID string, auth *clients.AuthClient, bot *tg.Bot) *Consumer {
 	return &Consumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
 			Brokers:  brokers,
@@ -26,6 +29,7 @@ func NewConsumer(brokers []string, topic, groupID string, auth *clients.AuthClie
 			MaxBytes: 10e6, // 10MB
 		}),
 		auth: auth,
+		bot:  bot,
 	}
 }
 
@@ -37,12 +41,19 @@ func (c *Consumer) Start(ctx context.Context) error {
 
 		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return fmt.Errorf("kafka fetch message: %w", err)
 		}
 
 		var event models.NotificationEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			l.Error("failed to unmarshal kafka message", slog.String("error", err.Error()))
+			err = c.reader.CommitMessages(ctx, msg)
+			if err != nil {
+				return fmt.Errorf("commit messages: %w", err)
+			}
 			continue
 		}
 
@@ -51,12 +62,22 @@ func (c *Consumer) Start(ctx context.Context) error {
 			l.Error("failed to get user chat_id",
 				slog.String("user_id", event.UserID),
 				slog.String("error", err.Error()))
+
+			err = c.reader.CommitMessages(ctx, msg)
+			if err != nil {
+				return fmt.Errorf("commit messages: %w", err)
+			}
 			continue
 		}
 
 		l.Info("ready to send notification",
 			slog.Int64("chat_id", resp.GetChatId()),
 			slog.String("msg", event.Message))
+
+		if err := c.bot.SendMessage(ctx, resp.GetChatId(), event.Message); err != nil {
+			l.Error("failed to send notification",
+				slog.String("error", err.Error()))
+		}
 
 		if err := c.reader.CommitMessages(ctx, msg); err != nil {
 			l.Error("failed to commit message", slog.String("error", err.Error()))

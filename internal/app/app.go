@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"notification-service/internal/clients"
 	"notification-service/internal/transport/kafka"
+	"notification-service/internal/transport/tg"
 	"notification-service/pkg/closer"
 	"notification-service/pkg/config"
 	"notification-service/pkg/logger"
@@ -20,6 +21,7 @@ type App struct {
 	closer        *closer.Closer
 	authClient    *clients.AuthClient
 	kafkaConsumer *kafka.Consumer
+	bot           *tg.Bot
 }
 
 func NewApp(ctx context.Context) (*App, error) {
@@ -38,9 +40,18 @@ func NewApp(ctx context.Context) (*App, error) {
 		return nil, fmt.Errorf("app.NewApp auth client: %w", err)
 	}
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	consumer := kafka.NewConsumer(brokers, cfg.KafkaTopic, cfg.KafkaGroup, authClient)
+
+	bot, err := tg.NewBot(cfg.Token, authClient)
+
+	consumer := kafka.NewConsumer(brokers, cfg.KafkaTopic, cfg.KafkaGroup, authClient, bot)
 
 	cl := closer.New()
+
+	cl.Add(func(ctx context.Context) error {
+		slog.Info("closing tg bot")
+		bot.BotAPI.StopReceivingUpdates()
+		return nil
+	})
 
 	cl.Add(func(_ context.Context) error {
 		slog.Info("closing kafka consumer")
@@ -57,6 +68,7 @@ func NewApp(ctx context.Context) (*App, error) {
 		closer:        cl,
 		authClient:    authClient,
 		kafkaConsumer: consumer,
+		bot:           bot,
 	}, nil
 }
 
@@ -69,6 +81,11 @@ func (a *App) Run(ctx context.Context) error {
 			errCh <- err
 		}
 	}()
+
+	go func() {
+		a.bot.Start(ctx)
+	}()
+
 	a.log.Info("starting app")
 
 	quit := make(chan os.Signal, 1)
